@@ -1,4 +1,4 @@
-start proposer --proposer
+start proposer --proposer --peer-names=acceptor1,acceptor2,acceptor3,acceptor4
 start acceptor1 --acceptor
 start acceptor2 --acceptor
 start acceptor3 --acceptor
