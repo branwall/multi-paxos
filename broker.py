@@ -41,9 +41,149 @@ class Message(dict):
     msg_frames = [destination, '', b]
     socket.send_multipart(msg_frames)
 
+class MessageConditions:
+  def __init__(self, broker):
+    self.broker = broker
+    self.drop_conditions = []
+    self.delay_conditions = []
+    self.tamper_conditions = []
+    self.after_conditions = []
+
+  def add_condition(self, command):
+    if (command['command'] == 'drop'):
+      self.drop_conditions.append(command)
+    elif command['command'] == 'after':
+      self.after_conditions.append(command)
+    elif command['command'] == 'delay':
+      command['messages'] = []
+      self.delay_conditions.append(command)
+    elif command['command'] == 'tamper':
+      self.tamper_conditions.append(command)
+
+  def check_conds(self, conds, message):
+    '''
+    Generic condition checker. Returns (all_match, destinations) where
+    all_match is True iff the message as a whole matches the condition, and
+    destinations is a set containing specific recipients for which it matches.
+    '''
+    all_match = False
+    destinations = set()
+    for cond in conds:
+      if cond['count'] == 0:
+        conds.remove(cond)
+        continue
+      m = self.matches(cond, message)
+      (any_match, sender_match, destination_matches) = m
+      if any_match or sender_match:
+        tamper_all = True
+      destinations = destinations.union(destination_matches)
+      if any(m):
+        cond['count'] -= 1
+
+    return (all_match, destinations)
+
+  def check_drop_conditions(self, message):
+    '''
+    Returns (should_drop, should_receive) where should_drop is true iff the
+    message's sender has messages to be blocked, and should_receive is a list
+    of nodes that should receive the message. Updates drop conditions
+    accordingly.
+    '''
+    should_receive = set(message['destination'])
+    should_drop, should_not_receive = self.check_conds(self.drop_conditions, message)
+    should_receive.difference_update(should_not_receive)
+    return (should_drop, should_receive)
+
+  def check_tamper_conditions(self, message):
+    '''
+    Returns (tamper_all, tamper_destinations) where tamper_all is True iff
+    every message should be tampered and tamper_destinations is a set of
+    destinations that should be tampered with.
+    '''
+    return self.check_conds(self.tamper_conditions, message)
+
+  def check_after_conditions(self, message):
+    '''
+    Tallies against existing after conditions, and pushes their commands to the
+    broker's script queue for any that hits zero.
+    '''
+    for cond in self.after_conditions:
+      # use 1 instead of 0 in order to enact these as the "0th" message comes in
+      if cond['count'] == 1: 
+        self.after_conditions.remove(cond)
+        continue
+      if any(self.matches(cond, message)):
+        cond['count'] -= 1
+      if cond['count'] == 1:
+        self.broker.script = cond['commands'] + self.broker.script
+
+  def check_delay_conditions(self, message):
+    '''
+    Returns (delay_all, delay_destinations, messages) where delay_all is True
+    iff the message should be delayed for all destinations, and
+    delay_destinations is the set of destinations for which it should be
+    delayed, and messages is a list of messages which should be sent now.
+    Furthermore, adds the messages to the condition information so they can be
+    sent later, and returns messages which should be sent now.
+    '''
+    delay_all = False
+    destinations = set()
+    messages = []
+    for cond in self.delay_conditions:
+      if cond['count'] == 0 and len(cond['messages']) == 0:
+        self.delay_conditions.remove(cond)
+        continue
+      for msg in cond['messages']:
+        if msg['delayed'] == cond['delay']:
+          messages.append(msg['message'])
+          cond['messages'].remove(msg)
+        else:
+          msg['delayed'] += 1
+      if delay_all or cond['count'] == 0:
+        continue
+      m = self.matches(cond, message)
+      (any_match, sender_match, destination_matches) = m
+      if any_match or sender_match:
+        delay_all = True
+        msg = {'message': message,
+               'delayed': 0}
+        cond['messages'].append(msg)
+      else:
+        destinations = destinations.union(destination_matches)
+        for dest in destination_matches:
+          msg = {'message': Message(message),
+                 'delayed': 0}
+          msg['message']['destination'] = [dest]
+          cond['messages'].append(msg)
+      if any(m):
+        cond['count'] -= 1
+
+    return (delay_all, destinations, messages)
+
+  def matches(self, cond, message):
+    '''
+    Check if a condition matches , returning a triple:
+    (any_match, sender_match, destination_matches)
+    Where any_match is True if the condition doesn't specify a target,
+    sender_match is True if the sender matches, and destination_matches is a
+    list of destinations that match.
+    '''
+    sender_name = self.broker.nodes_by_sender().get(message.sender)
+    any_match = False
+    sender_match = False
+    destination_matches = set()
+    if 'name' not in cond:
+      any_match = True
+    elif 'from' in cond and cond['name'] == sender_name:
+      sender_match = True
+    elif 'from' not in cond and cond['name'] in message['destination']:
+      # this could be unqualified (no to/from) or a to
+      destination_matches.add(cond['name'])
+    return (any_match, sender_match, destination_matches)
+
 class Broker:
   def __init__(self, node_executable, pub_endpoint, router_endpoint, script_filename=None):
-    self.loop = ioloop.ZMQIOLoop.current()
+    self.loop = ioloop.ZMQIOLoop.instance()
     self.context = zmq.Context()
 
     # PUB socket for sending messages to nodes
@@ -73,6 +213,9 @@ class Broker:
     self.logger = logging.getLogger('broker')
 
     self.node_executable = node_executable
+
+    self.message_conditions = MessageConditions(self)
+    self.partitions = {}
 
     # Load script if it exists
     self.script = None
@@ -123,35 +266,67 @@ class Broker:
     # handler dict
     if not hasattr(self, "message_handlers"):
       self.message_handlers = {
-        'hello': self.handle_hello,
+        'helloResponse': self.handle_hello,
+        'hello': self.handle_hello, # for backwards compatibility
         'log': self.handle_log,
         'getResponse': self.make_handle_response('getResponse'),
         'setResponse': self.make_handle_response('setResponse')
       }
 
-    try:
-      resp = self.handle(message)
-      resp.send(self.router, message.sender)
-      self.run_script(message)
-    except KeyError as e: # catchall for malformed messages
-      self.log("Missing key: " + str(e))
-      self.log_message(message)
+    resp = self.handle(message)
+    resp.send(self.router, message.sender)
+    self.run_script(message)
 
   def handle(self, message):
-      ty = message['type']
-      # Default to using the handle_unknown_type handler
-      f = self.message_handlers.get(ty, self.handle_unknown_type)
-      return f(message)
+    ty = message['type']
+    # Default to using the handle_unknown_type handler
+    f = self.message_handlers.get(ty, self.handle_unknown_type)
+    return f(message)
 
   def handle_unknown_type(self, message):
     '''
     Forward the message to every node listed in field 'destination', replacing
     the destination with only the recipient's name.
     '''
-    m = Message(message)
-    for dest in message['destination']:
-      m['destination'] = [dest]
-      m.send(self.pub, dest)
+    should_receive = set(message['destination'])
+    if message.sender:
+      node_name = self.nodes_by_sender()[message.sender]
+      partition = self.find_partition(node_name)
+      # if we're in a partition, only send to those also in the partition
+      if partition:
+        should_receive = should_receive.intersection(partition)
+        message['destination'] = list(should_receive)
+
+    should_drop, should_not_drop = self.message_conditions.check_drop_conditions(message)
+    should_receive = should_receive.intersection(should_not_drop)
+
+    should_delay, delay_destinations, delayed_messages = self.message_conditions.check_delay_conditions(message)
+    should_receive.difference_update(delay_destinations)
+
+    self.message_conditions.check_after_conditions(message)
+
+    original_value = message.get('value')
+    tamper_all, tamper_destinations = False, set()
+    if original_value:
+      tamper_all, tamper_destinations = self.message_conditions.check_tamper_conditions(message)
+
+    if not should_drop and not should_delay:
+      for dest in should_receive:
+        dest_partition = self.find_partition(dest)
+        if not dest_partition or dest_partition == partition:
+          if original_value and tamper_all or dest in tamper_destinations:
+            message['value'] = random.randint(0,1000)
+          else:
+            message['value'] = original_value
+          message['destination'] = [dest]
+          message.send(self.pub, dest)
+
+    # Note that delayed messages are subject to partitioning once they are
+    # sent, and will still cross partitions if they show up here after the
+    # partition has been created
+    for msg in delayed_messages:
+      for dest in msg['destination']:
+        msg.send(self.pub, dest)
 
     return Message({'type': 'okay'})
 
@@ -174,8 +349,8 @@ class Broker:
 
     self.node_zids[node_name] = message.sender
 
-    if self.script and 'hello' in self.script_conditions:
-      self.script_conditions.remove('hello')
+    if self.script and 'helloResponse' in self.script_conditions:
+      self.script_conditions.remove('helloResponse')
 
     self.log(node_name + " connected")
 
@@ -185,7 +360,7 @@ class Broker:
     '''
     Print or log to a file the given message, along with sender.
     '''
-    # self.log_message(message)
+    self.log_message(message)
     return Message({'type': 'okay'})
 
   def make_handle_response(self, ty):
@@ -208,23 +383,23 @@ class Broker:
 
       if self.script is None: return ok
       if ty not in self.script_conditions:
-        self.log("Did not expect {}, expected {}".format(ty, self.script_conditions))
+        self.log("{}: not in list of expected responses: {}".format(ty, self.script_conditions))
         return err
       if ty not in self.pending_requests:
         self.log("Expected {}, but no request found (found {})".format(ty, self.pending_requests.keys()))
         return err
       if not node_name == req['destination'][0]:
-        self.log("Different node than expected: {}, expected {}".format(node_name, req['destination'][0]))
+        self.log("{}: different node than expected: expected {}, expected {}".format(ty, node_name, req['destination'][0]))
         return err
       if not message['id'] == self.current_request_id:
-        self.log("Different request ID than expected: {}, expected {}".format(message['id'], req['id']))
+        self.log("{}: different request ID than expected: {}, expected {}".format(ty, message['id'], req['id']))
         return err
       if 'error' in message:
-        self.log("{}: {} {} ERROR: {}".format(node_name, ty, req['key'], message['error']))
+        self.log("{} ({}): {} ERROR: {}".format(ty, node_name, req['key'], message['error']))
         self.script_conditions.remove(ty)
         return ok
       else:
-        self.log("{}: {} {} => {}".format(node_name, ty, req['key'], message['value']))
+        self.log("{} ({}): {} => {}".format(ty, node_name, req['key'], message['value']))
         self.script_conditions.remove(ty)
         return ok
 
@@ -255,6 +430,14 @@ class Broker:
     '''
     self.logger.info(log_msg)
 
+  def find_partition(self, node_name):
+    '''
+    Retrieve the first encountered partition that the node is in.
+    '''
+    for part in self.partitions.values():
+      if node_name in part:
+        return part
+
   # ============================
   # Simulation control/scripting
   # ============================
@@ -272,7 +455,13 @@ class Broker:
         'stop': self.stop_node,
         'get': self.send_get,
         'set': self.send_set,
-        'json': self.send_json
+        'send': self.send_json,
+        'drop': self.message_conditions.add_condition,
+        'delay': self.message_conditions.add_condition,
+        'after': self.message_conditions.add_condition,
+        'tamper': self.message_conditions.add_condition,
+        'split': self.split_network,
+        'join': self.join_network
       }
       self.script_conditions = set()
       self.current_request_id = 0
@@ -313,7 +502,7 @@ class Broker:
     proc = subprocess.Popen(args, shell=True, stdout=self.devnull, stderr=self.devnull)
     self.node_pids[command['name']] = proc
 
-    self.script_conditions.add('hello')
+    self.script_conditions.add('helloResponse')
 
     self.make_hello_sender(command['name'])()
 
@@ -325,7 +514,7 @@ class Broker:
       'destination': [node_name]
     })
     def hello_sender():
-      if 'hello' in self.script_conditions:
+      if 'helloResponse' in self.script_conditions:
         msg.send(self.pub, node_name)
         self.loop.add_timeout(self.loop.time() + 0.1, hello_sender)
       return
@@ -351,14 +540,14 @@ class Broker:
       try:
         dest = command['name']
       except KeyError as e:
-        self.log("No such node " + str(e) + "will try again on next 'hello'")
+        self.log("No such node " + str(e) + "will try again on next 'helloResponse'")
         self.script.insert(0, command)
-        self.script_conditions.add('hello')
+        self.script_conditions.add('helloResponse')
         return
     elif len(self.node_zids) == 0:
-      self.log("No nodes online, will try again on next 'hello'")
+      self.log("No nodes online, will try again on next 'helloResponse'")
       self.script.insert(0, command)
-      self.script_conditions.add('hello')
+      self.script_conditions.add('helloResponse')
       return
     else:
       dest = random.choice(self.node_zids.keys())
@@ -381,14 +570,14 @@ class Broker:
       try:
         dest = command['name']
       except KeyError as e:
-        self.log("No such node " + str(e) + "will try again on next 'hello'")
+        self.log("No such node " + str(e) + "will try again on next 'helloResponse'")
         self.script.insert(0, command)
-        self.script_conditions.add('hello')
+        self.script_conditions.add('helloResponse')
         return
     elif len(self.node_zids) == 0:
-      self.log("No nodes online, will try again on next 'hello'")
+      self.log("No nodes online, will try again on next 'helloResponse'")
       self.script.insert(0, command)
-      self.script_conditions.add('hello')
+      self.script_conditions.add('helloResponse')
       return
     else:
       dest = random.choice(self.node_zids.keys())
@@ -403,11 +592,26 @@ class Broker:
       'destination': [dest]
     })
     self.pending_requests['setResponse'].send(self.pub, dest)
-
     pass
 
   def send_json(self, command):
     self.handle(Message(command['json']))
+    pass
+
+  def split_network(self, command):
+    if self.partitions.get(command['name']):
+      self.log("Attempted to create duplicate partition {}".format(command['name']))
+      return
+
+    self.log("Created partition {}".format(command['name']))
+    self.partitions[command['name']] = set(command['nodes'])
+
+  def join_network(self, command):
+    if not self.partitions.get(command['name']):
+      self.log("Attempted to delete nonexistent partition {}".format(command['name']))
+
+    self.log("Deleted partition {}".format(command['name']))
+    del self.partitions[command['name']]
     pass
 
 if __name__ == '__main__':
