@@ -1,5 +1,7 @@
 *.pyc
 *~
+*.out
+*.error
 bin/
 include/
 local/

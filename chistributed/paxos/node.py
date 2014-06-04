@@ -15,6 +15,8 @@ class Node:
     self.loop = ioloop.ZMQIOLoop.current()
     self.context = zmq.Context()
 
+    self.connected = False
+
     # SUB socket for receiving messages from the broker
     self.sub_sock = self.context.socket(zmq.SUB)
     self.sub_sock.connect(pub_endpoint)
@@ -39,6 +41,7 @@ class Node:
     for sig in [signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGQUIT]:
       signal.signal(sig, self.shutdown)
 
+
   def handle_broker_message(self, msg_frames):
     '''
     Nothing important to do here yet.
@@ -52,8 +55,13 @@ class Node:
       message['value'] = value
     return message
 
+  def respond_to_hello(self):
+    if not self.connected:
+      self.connected = True
+      self.req.send_json({'type': 'helloResponse', 'source': self.name})
+
   def log(self, debug_info):
-    self.req.json_send({'type': 'log', 'debug': debug_info})
+    self.req.send_json({'type': 'log', 'debug': debug_info})
 
   def start(self):
     '''
@@ -71,17 +79,19 @@ class Node:
 
 class Acceptor(Node):
   def __init__(self, *zmq_args):
-    zmq_args.append(self.handle)
+    zmq_args = tuple(list(zmq_args) + [self.handle])
     Node.__init__(self, *zmq_args)
     self.last_value_accepted = None
     self.current_number_promised = None
     self.rejected = []
     self.failed = False
 
-  def handle(self, msg_frame):
-    assert len(msg_frame) == 3
+  def handle(self, msg_frames):
+    assert len(msg_frames) == 3
     assert msg_frames[0] == self.name
     message = json.loads(msg_frames[2])
+    with open(self.name+'.out', 'a') as outfh:
+      print >> outfh, 'message:', message
 
     # Basic requests for store data
     if message['type'] == 'get':
@@ -90,54 +100,59 @@ class Acceptor(Node):
       self.log({'event': 'getting', 'node': self.name, 'key': k, 'value': v})
       self.req.send_json({'type': 'getResponse', 'id': msg['id'], 'value': v})
     elif message['type'] == 'paxos':
-      self.handle_paxos(message)
-    elif msg['type'] == 'hello':
+      try:
+        self.handle_paxos(message)
+      except Exception, e:
+        with open(self.name+'.error', 'a') as outfh:
+          print >> outfh, e
+    elif message['type'] == 'hello':
       # should be the very first message we see
-      self.req.send_json({'type': 'hello', 'source': self.name})
+      self.respond_to_hello()
     else:
       self.log({'event': 'unknown', 'node': self.name})
 
   def handle_paxos(self, message):
+    reply_dst = [message['src']]
     if message['msg'] == 'PREPARE':
       reply = None
       if self.current_number_promised == None:
         self.current_number_promised = message['num']
       if message['num'] < self.current_number_promised:
         if message['num'] not in self.rejected:
-          self.log({'event': 'rejecting', 'node': self.name,
-                    'num': message['num'], 'dst': message['src']})
-          reply = self.paxos_message('REJECTED', message['num'], message['src'])
+          self.log({'event': 'sending REJECT', 'node': self.name,
+                    'num': message['num'], 'dst': reply_dst})
+          reply = self.paxos_message('REJECTED', message['num'], reply_dst)
           self.req.send_json(reply)
           self.rejected.append(message['num'])
       else:
         self.current_number_promised = message['num']
         value = self.last_value_accepted
-        self.log({'event': 'promising', 'node': self.name,
-                  'num': message['num'], 'value': value, 'dst': message['src']})
-        reply = self.paxos_message('PROMISE', message['num'], message['src'],
-                                   value=value)
+        self.log({'event': 'sending PROMISE', 'node': self.name,
+                  'num': message['num'], 'value': value, 'dst': reply_dst})
+        reply = self.paxos_message('PROMISE', message['num'], reply_dst)
         self.req.send_json(reply)
-    elif message['type'] == 'ACCEPT':
+    elif message['msg'] == 'ACCEPT':
       reply = None
       if message['num'] < self.current_number_promised:
         if message['num'] not in self.rejected:
-          self.log({'event': 'rejecting', 'node': self.name,
-                    'num': message['num'], 'dst': message['src']})
-          reply = self.paxos_message('REJECTED', message['num'], message['src'])
+          self.log({'event': 'sending REJECTED', 'node': self.name,
+                    'num': message['num'], 'dst': reply_dst})
+          reply = self.paxos_message('REJECTED', message['num'], reply_dst)
           self.req.send_json(reply)
           self.rejected.append(message['num'])
       else:
         self.last_value_accepted = message['value']
-        self.log({'event': 'accepted', 'node': self.name,
-                  'num': message['num'], 'value': value, 'dst': message['src']})
-        reply = self.paxos_message('ACCEPTED', message['num'], message['src'],
+        self.log({'event': 'sending ACCEPTED', 'node': self.name,
+                  'num': message['num'], 'value': message['value'], 
+                  'dst': reply_dst})
+        reply = self.paxos_message('ACCEPTED', message['num'], reply_dst,
                                    value=message['value'])
         self.req.send_json(reply)
 
 
-class Proposer:
+class Proposer(Node):
   def __init__(self, *zmq_args):
-    zmq_args.append(self.handle)
+    zmq_args = tuple(list(zmq_args) + [self.handle])
     Node.__init__(self, *zmq_args)
     self.state = None
     self.received_promise = {}
@@ -149,6 +164,7 @@ class Proposer:
     self.current_proposal_val = None
     self.consensus_on = None
     self.failed = False
+    self.current_set_id = None
 
   def set_to_promise(self):
     self.state = 'PROMISE'
@@ -162,21 +178,23 @@ class Proposer:
     self.recevied_accepted = {}
     self.accepted_rejected = {}
 
-  def handle(self, msg_frame):
-    assert len(msg_frame) == 3
+  def handle(self, msg_frames):
+    assert len(msg_frames) == 3
     assert msg_frames[0] == self.name
     message = json.loads(msg_frames[2])
+    with open(self.name+'.out', 'a') as outfh:
+      print >> outfh, 'message:', message
 
     # Basic requests for store data
     if message['type'] == 'get':
-      k = msg['key']
+      k = message['key']
       v = self.store.get(k)
       if v:
         self.log({'event': 'getting', 'node': self.name, 'key': k, 'value': v})
-        self.req.send_json({'type': 'getResponse', 'id': msg['id'], 'value': v})
+        self.req.send_json({'type': 'getResponse', 'id': message['id'], 'value': v})
       else:
         self.log({'event': 'bad get (no such key)', 'node': self.name, 'key': k})
-        self.req.send_json({'type': 'getResponse', 'id': msg['id'], 
+        self.req.send_json({'type': 'getResponse', 'id': message['id'], 
                             'error': 'bad get (no such key: %s)' % k})
     # Start a new round of Paxos
     elif message['type'] == 'set':
@@ -184,16 +202,21 @@ class Proposer:
       self.current_proposal_val = message['value']
       num = 0 # TODO: Find a better way to implement this
       self.current_proposal_num = num
+      self.current_set_id = message['id']
       self.log({'event': 'sending PREPARE', 'node': self.name,
-                'num': num, 'dst': self.acceptors})
+                'num': num, 'dst': self.acceptors, 'id': self.current_set_id})
       self.req.send_json(self.paxos_message('PREPARE', num, self.acceptors))
       self.set_to_promise()
     # Handle internal Paxos messages
     elif message['type'] == 'paxos':
-      self.handle_paxos(message)
-    elif msg['type'] == 'hello':
+      try:
+        self.handle_paxos(message)
+      except Exception, e:
+        with open(self.name+'.error', 'a') as outfh:
+          print >> outfh, e
+    elif message['type'] == 'hello':
       # should be the very first message we see
-      self.req.send_json({'type': 'hello', 'source': self.name})
+      self.respond_to_hello()
     else:
       self.log({'event': 'unknown', 'node': self.name})
 
@@ -216,8 +239,10 @@ class Proposer:
         self.received_accepted[message['src']] = True
         if len(self.received_accepted) > len(self.acceptors)/2:
           self.log({'event': 'accepted value', 'node': self.name,
-                    'value': message['value']})
+                    'value': message['value'], 'id': self.current_set_id})
           self.store['accepted'] = message['value']
+          self.req.send_json({'type': 'setResponse', 'id': self.current_set_id,
+                              'value': message['value']})
     elif message['msg'] == 'REJECTED':
       if message['num'] == self.current_proposal_num:
         if self.state == 'PROMISE':

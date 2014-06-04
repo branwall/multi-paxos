@@ -3,6 +3,4 @@ start acceptor1 --acceptor
 start acceptor2 --acceptor
 start acceptor3 --acceptor
 start acceptor4 --acceptor
-set proposer accepted 40
-get proposer accepted
-get acceptor1 accepted
+set proposer key 42
