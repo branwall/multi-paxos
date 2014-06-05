@@ -1,5 +1,4 @@
 from Queue import Queue
-import re
 import random
 import json
 import sys
@@ -203,7 +202,7 @@ class Proposer(Node):
       self.orig_proposal_val = message['value']
       self.current_proposal_val = message['value']
       #num = 0 # TODO: Find a better way to implement this
-      num = int(re.search('[0-9]*$', self.name).group(0))
+      num = message['id']
       self.current_proposal_num = num
       self.current_set_id = message['id']
       self.log({'event': 'sending PREPARE', 'node': self.name,
@@ -246,6 +245,7 @@ class Proposer(Node):
           self.store['accepted'] = message['value']
           self.req.send_json({'type': 'setResponse', 'id': self.current_set_id,
                               'value': message['value']})
+          self.state = None
     elif message['msg'] == 'REJECTED':
       if message['num'] == self.current_proposal_num:
         if self.state == 'PROMISE':

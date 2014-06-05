@@ -1,0 +1,11 @@
+start proposer1 --proposer --peer-names acceptor1,acceptor2,acceptor3,acceptor4
+start proposer2 --proposer --peer-names acceptor1,acceptor2,acceptor3,acceptor4
+start acceptor1 --acceptor
+start acceptor2 --acceptor
+start acceptor3 --acceptor
+start acceptor4 --acceptor
+after 9 {
+  delay 4 from proposer1 by 18
+}
+set proposer1 key 42
+set proposer2 key 31
