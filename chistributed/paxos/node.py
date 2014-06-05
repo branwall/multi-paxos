@@ -1,4 +1,5 @@
 from Queue import Queue
+import re
 import random
 import json
 import sys
@@ -129,7 +130,8 @@ class Acceptor(Node):
         value = self.last_value_accepted
         self.log({'event': 'sending PROMISE', 'node': self.name,
                   'num': message['num'], 'value': value, 'dst': reply_dst})
-        reply = self.paxos_message('PROMISE', message['num'], reply_dst)
+        reply = self.paxos_message('PROMISE', message['num'], reply_dst,
+                                   value=value)
         self.req.send_json(reply)
     elif message['msg'] == 'ACCEPT':
       reply = None
@@ -200,7 +202,8 @@ class Proposer(Node):
     elif message['type'] == 'set':
       self.orig_proposal_val = message['value']
       self.current_proposal_val = message['value']
-      num = 0 # TODO: Find a better way to implement this
+      #num = 0 # TODO: Find a better way to implement this
+      num = int(re.search('[0-9]*$', self.name).group(0))
       self.current_proposal_num = num
       self.current_set_id = message['id']
       self.log({'event': 'sending PREPARE', 'node': self.name,
