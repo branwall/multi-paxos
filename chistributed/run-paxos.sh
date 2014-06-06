@@ -1,2 +1,2 @@
 #!/bin/bash
-python broker.py -e "python paxos/node.py" -s "$1"
+python broker.py -e "python paxos/multi-node.py" -s "$1"
